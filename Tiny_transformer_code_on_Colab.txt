@@ -1,0 +1,703 @@
+# =============================================================================
+# Importing Libraries
+# =============================================================================
+!pip install wfdb
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers
+import h5py
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    classification_report, confusion_matrix
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+import time
+import os
+from sklearn.utils import class_weight
+from sklearn.model_selection import train_test_split
+from keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+import wfdb
+import random
+import scipy.signal
+from scipy import signal
+from collections import Counter
+import json
+import pandas as pd
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+class Config:
+    # Model hyperparameters
+    class_types = ['N', 'S', 'V', 'F', 'Q']
+    num_heads = 8
+    hidden_size = 2
+    embedding = 16
+    mlp_dim = 128
+    kernel = 3
+    emb_depth = 1
+    transformer_layers = 1
+    half_window = 99
+    batch_size = 128
+
+    # Training parameters
+    learning_rate = 2e-3
+    epochs = 100
+    patience = 25
+    random_seed = 42
+
+    # Data paths
+    data_path = 'physionet.org/files/mitdb/1.0.0/'
+    splits_file = 'consistent_data_splits.npz'
+    baseline_weights = 'baseline_ecg_transformer.weights.h5'
+    baseline_results = 'baseline_results.json'
+
+config = Config()
+
+# Set all random seeds for reproducibility
+np.random.seed(config.random_seed)
+tf.random.set_seed(config.random_seed)
+random.seed(config.random_seed)
+
+# =============================================================================
+# ECG DATA PREPROCESSING
+# =============================================================================
+def butter_bandpass(lowcut, highcut, fs, order=5):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = signal.butter(order, [low, high], btype='band')
+    return b, a
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = signal.lfilter(b, a, data)
+    return y
+
+def preprocess_ecg(signal_data, fs=360):
+    """Preprocess ECG signal: bandpass filter 0.5-40 Hz + normalization"""
+    filtered = butter_bandpass_filter(signal_data, 0.5, 40.0, fs, order=5)
+    normalized = (filtered - np.mean(filtered)) / (np.std(filtered) + 1e-8)
+    return normalized
+
+def extract_beats(record_path, classes_to_use=None):
+    """Extract beats from a single MIT-BIH record with proper AAMI mapping"""
+    if classes_to_use is None:
+        classes_to_use = config.class_types
+
+    # MIT-BIH to AAMI symbol mapping (AAMI EC57 standard)
+    mit_bih_to_aami = {
+        'N': 'N', 'L': 'N', 'R': 'N', 'e': 'N', 'j': 'N','B':'N',
+        'A': 'S', 'a': 'S', 'J': 'S', 'S': 'S',
+        'V': 'V', 'E': 'V',
+        'F': 'F',
+        '/': 'Q', 'f': 'Q', 'Q': 'Q',
+    }
+
+    try:
+        record = wfdb.rdrecord(record_path)
+        annotation = wfdb.rdann(record_path, 'atr')
+    except Exception as e:
+        print(f"Error reading {record_path}: {e}")
+        return [], [], []
+
+    signal_data = record.p_signal[:, 0]
+    fs = record.fs
+    signal_data = preprocess_ecg(signal_data, fs)
+
+    beats, labels, rr_intervals = [], [], []
+    r_peaks = annotation.sample
+    symbols = annotation.symbol
+
+    for i in range(1, len(r_peaks) - 1):
+        mit_symbol = symbols[i]
+        if mit_symbol in mit_bih_to_aami:
+            aami_class = mit_bih_to_aami[mit_symbol]
+            if aami_class in classes_to_use:
+                start = r_peaks[i] - config.half_window
+                end = r_peaks[i] + config.half_window
+
+                if start < 0 or end >= len(signal_data):
+                    continue
+
+                beat = signal_data[start:end]
+
+                # Calculate RR intervals (normalized)
+                pre_rr = (r_peaks[i] - r_peaks[i-1]) / fs
+                post_rr = (r_peaks[i+1] - r_peaks[i]) / fs
+                pre_rr = np.clip(pre_rr, 0, 2)
+                post_rr = np.clip(post_rr, 0, 2)
+
+                beats.append(beat)
+                labels.append(aami_class)
+                rr_intervals.append([pre_rr, post_rr])
+
+    return beats, labels, rr_intervals
+
+# =============================================================================
+# Dataset load and split
+# =============================================================================
+def load_mit_bih_data():
+    """Load complete MIT-BIH dataset"""
+
+    all_records = ['100', '101', '102', '103', '104', '105', '106', '107', '108', '109',
+                   '111', '112', '113', '114', '115', '116', '117', '118', '119', '121',
+                   '122', '123', '124', '200', '201', '202', '203', '205', '207', '208',
+                   '209', '210', '212', '213', '214', '215', '217', '219', '220', '221',
+                   '222', '223', '228', '230', '231', '232', '233', '234']
+
+    all_beats = []
+    all_labels = []
+    all_rr_intervals = []
+
+    print(f"Loading MIT-BIH data from {config.data_path}...")
+    for record in all_records:
+        try:
+            record_path = os.path.join(config.data_path, record)
+            beats, labels, rr_intervals = extract_beats(record_path)
+            all_beats.extend(beats)
+            all_labels.extend(labels)
+            all_rr_intervals.extend(rr_intervals)
+            print(f"  ✓ Record {record}: {len(beats)} beats")
+        except Exception as e:
+            print(f"  ✗ Record {record}: {e}")
+
+    # Convert to numpy arrays
+    all_beats = np.array(all_beats)
+    all_rr_intervals = np.array(all_rr_intervals)
+
+    # Convert labels to integers
+    label_map = {label: idx for idx, label in enumerate(config.class_types)}
+    all_labels_int = np.array([label_map[label] for label in all_labels])
+
+    print(f"\nTotal beats loaded: {len(all_beats)}")
+    print(f"Label distribution: {Counter(all_labels)}")
+
+    return all_beats, all_labels_int, all_rr_intervals
+
+def create_consistent_data_splits(force_recreate=False):
+    """Create train/val/test splits"""
+    if os.path.exists(config.splits_file) and not force_recreate:
+        print(f"Loading existing data splits from {config.splits_file}")
+        data = np.load(config.splits_file)
+        return (data['X_train'], data['X_val'], data['X_test'],
+                data['y_train'], data['y_val'], data['y_test'],
+                data['RR_train'], data['RR_val'], data['RR_test'])
+
+    print("Creating data splits...")
+
+    # Load complete dataset
+    beats, labels, rr_intervals = load_mit_bih_data()
+    if len(beats) == 0:
+        raise ValueError("No data loaded! Check your data path.")
+
+    # Step 1: 70% train, 30% temp (validation + test)
+    X_train, X_temp, y_train, y_temp, RR_train, RR_temp = train_test_split(
+        beats, labels, rr_intervals,
+        test_size=0.30,
+        random_state=config.random_seed,
+        stratify=labels
+    )
+
+    # Step 2: Split temp into 10% validation, 20% test
+    X_val, X_test, y_val, y_test, RR_val, RR_test = train_test_split(
+        X_temp, y_temp, RR_temp,
+        test_size=2/3,
+        random_state=config.random_seed,
+        stratify=y_temp
+    )
+
+    # Print split distributions
+    def print_split_info(y, split_name):
+        unique, counts = np.unique(y, return_counts=True)
+        total = len(y)
+        print(f"\n{split_name} ({total} samples, {total/len(labels)*100:.1f}%):")
+        for class_idx, count in zip(unique, counts):
+            class_name = config.class_types[class_idx]
+            percentage = (count / total) * 100
+            print(f"  {class_name}: {count:5d} ({percentage:5.1f}%)")
+
+    print_split_info(y_train, "Training")
+    print_split_info(y_val, "Validation")
+    print_split_info(y_test, "Test")
+
+    # Save splits for consistency across experiments
+    np.savez(config.splits_file,
+             X_train=X_train, X_val=X_val, X_test=X_test,
+             y_train=y_train, y_val=y_val, y_test=y_test,
+             RR_train=RR_train, RR_val=RR_val, RR_test=RR_test)
+
+    print(f"Data splits saved to {config.splits_file}")
+
+    return X_train, X_val, X_test, y_train, y_val, y_test, RR_train, RR_val, RR_test
+
+# =============================================================================
+# DATASET CREATION
+# =============================================================================
+def create_datasets(X_train, RR_train, y_train, X_val, RR_val, y_val, batch_size):
+    """Create TensorFlow datasets for training"""
+    autotune = tf.data.AUTOTUNE
+
+    # Reshape for Conv2D
+    X_train = X_train.reshape(-1, 198, 1, 1)
+    X_val = X_val.reshape(-1, 198, 1, 1)
+
+    # Convert to categorical
+    y_train_cat = tf.keras.utils.to_categorical(y_train, num_classes=len(config.class_types))
+    y_val_cat = tf.keras.utils.to_categorical(y_val, num_classes=len(config.class_types))
+
+    # Training dataset
+    train_data = tf.data.Dataset.from_tensor_slices(X_train)
+    train_RR = tf.data.Dataset.from_tensor_slices(RR_train)
+    train_labels = tf.data.Dataset.from_tensor_slices(y_train_cat)
+
+    X_train_ds = tf.data.Dataset.zip((train_data, train_RR)).map(
+        lambda x1, x2: {'x1': x1, 'x2': x2}
+    )
+    train_ds = tf.data.Dataset.zip((X_train_ds, train_labels))
+    train_ds = (train_ds.shuffle(10000, seed=config.random_seed)
+                .batch(batch_size)
+                .prefetch(autotune))
+
+    # Validation dataset
+    val_data = tf.data.Dataset.from_tensor_slices(X_val)
+    val_RR = tf.data.Dataset.from_tensor_slices(RR_val)
+    val_labels = tf.data.Dataset.from_tensor_slices(y_val_cat)
+
+    X_val_ds = tf.data.Dataset.zip((val_data, val_RR)).map(
+        lambda x1, x2: {'x1': x1, 'x2': x2}
+    )
+    val_ds = tf.data.Dataset.zip((X_val_ds, val_labels))
+    val_ds = (val_ds.batch(batch_size)
+              .prefetch(autotune))
+
+    return train_ds, val_ds
+
+def create_test_dataset(X_test, RR_test, y_test, batch_size):
+    """Create test dataset"""
+    X_test = X_test.reshape(-1, 198, 1, 1)
+    y_test_cat = tf.keras.utils.to_categorical(y_test, num_classes=len(config.class_types))
+
+    test_data = tf.data.Dataset.from_tensor_slices(X_test)
+    test_RR = tf.data.Dataset.from_tensor_slices(RR_test)
+    test_labels = tf.data.Dataset.from_tensor_slices(y_test_cat)
+
+    X_test_ds = tf.data.Dataset.zip((test_data, test_RR)).map(
+        lambda x1, x2: {'x1': x1, 'x2': x2}
+    )
+    test_ds = tf.data.Dataset.zip((X_test_ds, test_labels))
+    test_ds = test_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return test_ds
+
+# =============================================================================
+# MODEL COMPONENTS
+# =============================================================================
+def generate_patch_conv_orgPaper_f(embedding, inputs):
+    patches = layers.Conv2D(filters=embedding, kernel_size=[config.kernel,1],
+                           strides=[config.kernel,1], padding='valid')(inputs)
+    for _ in range(config.emb_depth - 1):
+        patches = layers.BatchNormalization()(patches)
+        patches = layers.Conv2D(filters=embedding, kernel_size=[config.kernel,1],
+                               strides=[config.kernel,1], padding='valid')(patches)
+
+    row_axis, col_axis = (1, 2)
+    seq_len = (patches.shape[row_axis]) * (patches.shape[col_axis])
+    x = layers.Reshape((seq_len, embedding))(patches)
+    return x
+
+class AddPositionEmbs(layers.Layer):
+    def __init__(self, posemb_init=None, **kwargs):
+        super().__init__(**kwargs)
+        self.posemb_init = posemb_init
+
+    def build(self, inputs_shape):
+        pos_emb_shape = (1, inputs_shape[1], inputs_shape[2])
+        self.pos_embedding = self.add_weight(
+            name='pos_embedding',
+            shape=pos_emb_shape,
+            initializer=self.posemb_init,
+            trainable=True
+        )
+
+    def call(self, inputs, inputs_positions=None):
+        pos_embedding = tf.cast(self.pos_embedding, inputs.dtype)
+        return inputs + pos_embedding
+
+def mlp_block_f(mlp_dim, inputs):
+    x = layers.Dense(units=mlp_dim, activation=tf.nn.gelu)(inputs)
+    x = layers.Dropout(rate=0.1)(x)
+    x = layers.Dense(units=inputs.shape[-1], activation=tf.nn.gelu)(x)
+    x = layers.Dropout(rate=0.1)(x)
+    return x
+
+def BaselineEncoder1Dblock(num_heads, mlp_dim, inputs):
+    """Standard transformer block with multi-head attention"""
+    x = layers.LayerNormalization(dtype=inputs.dtype)(inputs)
+    x = layers.MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=config.hidden_size,
+        dropout=0.1
+    )(x, x)
+    x = layers.Add()([x, inputs])
+
+    y = layers.LayerNormalization(dtype=x.dtype)(x)
+    y = mlp_block_f(mlp_dim, y)
+    y_1 = layers.Add()([y, x])
+    return y_1
+
+def build_baseline_ViT():
+    """Build baseline Vision Transformer """
+    inputs = layers.Input(shape=(198,1,1), name='x1')
+    RR_feat = layers.Input(shape=(2,), name='x2')
+
+    patches = generate_patch_conv_orgPaper_f(config.embedding, inputs)
+    x = AddPositionEmbs(
+        posemb_init=tf.keras.initializers.RandomNormal(stddev=0.02),
+        name='posembed_input'
+    )(patches)
+    x = layers.Dropout(rate=0.2)(x)
+
+    x = BaselineEncoder1Dblock(config.num_heads, config.mlp_dim, x)
+    encoded = layers.LayerNormalization(name='encoder_norm')(x)
+    im_representation = layers.GlobalAveragePooling1D()(encoded)
+
+    emb_RR = layers.Dense(units=2, use_bias=False)(RR_feat)
+    im_representation = layers.Concatenate()([im_representation, emb_RR])
+
+    logits = layers.Dense(
+        units=len(config.class_types),
+        name='head',
+        kernel_initializer=tf.keras.initializers.zeros()
+    )(im_representation)
+
+    model = tf.keras.Model(inputs=[inputs, RR_feat], outputs=logits)
+    return model
+
+# =============================================================================
+# TRAINING FUNCTION
+# =============================================================================
+def train_baseline_model(model, train_ds, val_ds, weights_path):
+    """Train baseline model"""
+    print(f"\n Training Baseline ECG Transformer...")
+
+    # Compile model
+    optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
+    model.compile(
+        optimizer=optimizer,
+        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        metrics=['accuracy']
+    )
+
+    # Callbacks
+    checkpoint = ModelCheckpoint(
+        weights_path,
+        monitor='val_accuracy',
+        save_best_only=True,
+        save_weights_only=True,
+        mode='max',
+        verbose=1
+    )
+
+    early_stopping = EarlyStopping(
+        monitor='val_accuracy',
+        patience=config.patience,
+        restore_best_weights=True,
+        mode='max',
+        verbose=1
+    )
+
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=10,
+        min_lr=1e-7,
+        verbose=1
+    )
+
+    # Train model
+    history = model.fit(
+        train_ds,
+        epochs=config.epochs,
+        validation_data=val_ds,
+        callbacks=[checkpoint, early_stopping, reduce_lr],
+        verbose=1
+    )
+
+    print(f"✅ Baseline training completed!")
+    print(f"Best validation accuracy: {max(history.history['val_accuracy']):.4f}")
+
+    return history
+
+# =============================================================================
+# EVALUATION FUNCTION
+# =============================================================================
+def evaluate_baseline_model(model, test_ds, y_test):
+    """Evaluate baseline model comprehensively"""
+    print(f"\n Evaluating Baseline Model...")
+
+    # Compile model for evaluation
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        metrics=['accuracy']
+    )
+
+    # Collect predictions
+    logits_list = []
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
+
+    print("Running inference...")
+    for batch_idx, batch in enumerate(test_ds):
+        inputs_dict, labels_onehot = batch
+
+        # Forward pass
+        logits = model(inputs_dict, training=False)
+        logits_np = logits.numpy()
+        logits_list.append(logits_np)
+
+        # Calculate metrics
+        bsize = logits_np.shape[0]
+        total_samples += bsize
+
+        batch_loss = loss_fn(labels_onehot, logits).numpy()
+        total_loss += batch_loss * bsize
+
+        preds_int = np.argmax(logits_np, axis=1)
+        true_int = np.argmax(labels_onehot.numpy(), axis=1)
+        total_correct += np.sum(preds_int == true_int)
+
+        if (batch_idx + 1) % 10 == 0:
+            print(f"  Processed {batch_idx + 1} batches...")
+
+    # Final metrics
+    test_loss = total_loss / total_samples
+    test_accuracy = total_correct / total_samples
+
+    # Get predictions and probabilities
+    all_logits = np.concatenate(logits_list, axis=0)
+    y_pred_probs = tf.nn.softmax(all_logits, axis=1).numpy()
+    y_pred = np.argmax(y_pred_probs, axis=1)
+
+    # Detailed metrics with zero_division parameter
+    precision_macro = precision_score(y_test, y_pred, average='macro', zero_division=0)
+    recall_macro = recall_score(y_test, y_pred, average='macro', zero_division=0)
+    f1_macro = f1_score(y_test, y_pred, average='macro', zero_division=0)
+
+    precision_weighted = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+    recall_weighted = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+    f1_weighted = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+    print(f"\n Model Test Results:")
+    print(f"Test Loss:           {test_loss:.4f}")
+    print(f"Test Accuracy:       {test_accuracy:.4f}")
+    print(f"Precision (macro):   {precision_macro:.4f}")
+    print(f"Recall (macro):      {recall_macro:.4f}")
+    print(f"F1-Score (macro):    {f1_macro:.4f}")
+    print(f"Precision (weighted): {precision_weighted:.4f}")
+    print(f"Recall (weighted):   {recall_weighted:.4f}")
+    print(f"F1-Score (weighted): {f1_weighted:.4f}")
+
+    # Classification report
+    print(f"\n Classification Report:")
+    print(classification_report(y_test, y_pred, target_names=config.class_types, digits=4))
+
+    results = {
+        #'model_name': 'Baseline',
+        'test_accuracy': float(test_accuracy),
+        'test_loss': float(test_loss),
+        'precision_macro': float(precision_macro),
+        'recall_macro': float(recall_macro),
+        'f1_macro': float(f1_macro),
+        'precision_weighted': float(precision_weighted),
+        'recall_weighted': float(recall_weighted),
+        'f1_weighted': float(f1_weighted),
+        'predictions': y_pred.tolist(),
+        'true_labels': y_test.tolist()
+    }
+
+    return results
+
+# =============================================================================
+# VISUALIZATION FUNCTIONS
+# =============================================================================
+def plot_baseline_training_history(history, save_path='training_history.png'):
+    """Plot training history"""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # Loss plots
+    axes[0, 0].plot(history.history['loss'], label='Train Loss')
+    axes[0, 0].set_title('Training Loss')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+
+    axes[0, 1].plot(history.history['val_loss'], label='Val Loss', color='orange')
+    axes[0, 1].set_title('Validation Loss')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+
+    # Accuracy plots
+    axes[1, 0].plot(history.history['accuracy'], label='Train Accuracy')
+    axes[1, 0].set_title('Training Accuracy')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Accuracy')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+
+    axes[1, 1].plot(history.history['val_accuracy'], label='Val Accuracy', color='orange')
+    axes[1, 1].set_title('Validation Accuracy')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Accuracy')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_baseline_confusion_matrix(results, save_path='confusion_matrix.png'):
+    """Plot confusion matrix for the model"""
+    y_true = results['true_labels']
+    y_pred = results['predictions']
+
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+               xticklabels=config.class_types, yticklabels=config.class_types)
+    plt.title(f'Model Confusion Matrix\nAccuracy: {results["test_accuracy"]:.4f}')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+def download_mitbih_data():
+    """Download MIT-BIH dataset if not present"""
+    if not os.path.exists(config.data_path):
+        print("📥 Downloading MIT-BIH Arrhythmia Database...")
+        os.system('wget -r -N -c -np https://physionet.org/files/mitdb/1.0.0/')
+        print("✅ Download completed!")
+    else:
+        print("✅ MIT-BIH data already exists.")
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+def main():
+    """Main execution for the model"""
+    print(" Tiny Transformer - Training & Evaluation")
+    print("=" * 60)
+
+    # Setup GPU if available
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f" Found {len(gpus)} GPU(s), memory growth enabled")
+        except RuntimeError as e:
+            print(f"GPU setup error: {e}")
+    else:
+        print(" No GPU found, running on CPU")
+
+    # Download data if needed
+    download_mitbih_data()
+
+    # Create consistent data splits
+    print("\n Creating/Loading data splits...")
+    X_train, X_val, X_test, y_train, y_val, y_test, RR_train, RR_val, RR_test = create_consistent_data_splits()
+
+    # Calculate class weights
+    class_weights = class_weight.compute_class_weight(
+        'balanced', classes=np.unique(y_train), y=y_train
+    )
+    class_weight_dict = dict(enumerate(class_weights))
+    print(f"Class weights: {class_weight_dict}")
+
+    # Create datasets
+    train_ds, val_ds = create_datasets(X_train, RR_train, y_train, X_val, RR_val, y_val, config.batch_size)
+    test_ds = create_test_dataset(X_test, RR_test, y_test, config.batch_size)
+
+    # Build and train baseline model
+    print("\n🏗️  Building Baseline Model...")
+    baseline_model = build_baseline_ViT()
+    baseline_model.summary()
+    print(f"Baseline model parameters: {baseline_model.count_params():,}")
+
+    # Check if model already exists
+    if os.path.exists(config.baseline_weights):
+        print(f"\n Found existing baseline weights: {config.baseline_weights}")
+        choice = input("Do you want to (1) Retrain, (2) Load existing, or (3) Skip training? [1/2/3]: ")
+
+        if choice == '2':
+            print(" Loading existing baseline weights...")
+            baseline_model.load_weights(config.baseline_weights)
+            history = None
+        elif choice == '3':
+            print("Skipping baseline training...")
+            return
+        else:
+            print(" Retraining baseline model...")
+            history = train_baseline_model(baseline_model, train_ds, val_ds, config.baseline_weights)
+            baseline_model.load_weights(config.baseline_weights)
+    else:
+        history = train_baseline_model(baseline_model, train_ds, val_ds, config.baseline_weights)
+        baseline_model.load_weights(config.baseline_weights)
+
+    # Evaluate baseline model
+    print("\n Evaluating Baseline Model...")
+    results = evaluate_baseline_model(baseline_model, test_ds, y_test)
+
+    # Save results
+    with open(config.baseline_results, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f" Results saved to {config.baseline_results}")
+
+    # Generate visualizations
+    if history is not None:
+        print("\n Generating training history plot...")
+        plot_baseline_training_history(history)
+
+    print(" Generating confusion matrix...")
+    plot_baseline_confusion_matrix(results)
+
+    # Final summary
+    print("\n" + "="*60)
+    print("🎉 MODEL SUMMARY")
+    print("="*60)
+    print(f"Test Accuracy:     {results['test_accuracy']:.4f}")
+    print(f"Test Loss:         {results['test_loss']:.4f}")
+    print(f"F1-Score (macro):  {results['f1_macro']:.4f}")
+    print(f"F1-Score (weighted): {results['f1_weighted']:.4f}")
+
+    print(f"\n Files Generated:")
+    print(f"  - {config.baseline_weights} (model weights)")
+    print(f"  - {config.baseline_results} (detailed results)")
+    print(f"  - {config.splits_file} (data splits for consistency)")
+    print(f"  - training_history.png")
+    print(f"  - confusion_matrix.png")
+
+    print(f"\n Baseline model training and evaluation completed!")
+    return results
+
+if __name__ == "__main__":
+    # Install required package if needed
+    try:
+        import wfdb
+    except ImportError:
+        print("Installing wfdb package...")
+        os.system('pip install wfdb')
+        import wfdb
+
+    # Run baseline pipeline
+    results = main()
+
